@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+*.xlsx
+*.xls
+*.csv
+!futures mapping.csv
+.env
+venv/
+temp/
