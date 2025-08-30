@@ -672,7 +672,7 @@ class EnhancedPortfolioTransformer:
             raise
     
     def _load_ms_position_positions(self, excel_file_path: str) -> None:
-        """Load positions from MS Position sheet Excel format - FIXED"""
+        """Load positions from MS Position sheet Excel format - FIXED with better debugging"""
         try:
             # First, read raw data to find where actual data starts
             df_raw = read_excel_with_password(excel_file_path, header=None)
@@ -743,9 +743,19 @@ class EnhancedPortfolioTransformer:
             skipped_zero = 0
             skipped_parse_error = 0
             skipped_no_mapping = 0
+            skipped_invalid = 0
             processed = 0
             
             logger.info(f"📋 Processing data starting from row {data_start_row + 1}")
+            
+            # Debug: Show first few rows of data
+            logger.info("📋 First few data rows (Contract ID | Position):")
+            for idx in range(data_start_row, min(data_start_row + 5, len(df_raw))):
+                contract_val = str(df_raw.iloc[idx, 0]).strip() if pd.notna(df_raw.iloc[idx, 0]) else "EMPTY"
+                pos_val = "N/A"
+                if position_col_idx < len(df_raw.columns):
+                    pos_val = str(df_raw.iloc[idx, position_col_idx])
+                logger.info(f"  Row {idx + 1}: {contract_val[:50]} | {pos_val}")
             
             for idx in range(data_start_row, len(df_raw)):
                 try:
@@ -756,6 +766,9 @@ class EnhancedPortfolioTransformer:
                     
                     # Skip if no valid contract
                     if not contract_id or contract_id.lower() in ['nan', 'none', ''] or '-' not in contract_id:
+                        if contract_id and contract_id.lower() not in ['nan', 'none', '']:
+                            logger.debug(f"Skipping row {idx + 1}: Invalid contract format: {contract_id[:30]}")
+                            skipped_invalid += 1
                         continue
                     
                     # Position value
@@ -770,6 +783,7 @@ class EnhancedPortfolioTransformer:
                     try:
                         open_pos = float(position_value) if pd.notna(position_value) else 0.0
                     except (ValueError, TypeError):
+                        logger.debug(f"Row {idx + 1}: Cannot convert position to float: {position_value}")
                         continue
                     
                     if open_pos == 0:
@@ -853,7 +867,20 @@ class EnhancedPortfolioTransformer:
                     continue
             
             self.positions = positions
-            self._print_processing_summary(processed, skipped_zero, skipped_parse_error, skipped_no_mapping, len(df_raw) - data_start_row)
+            
+            logger.info(f"📊 MS Position Processing Summary:")
+            logger.info(f"  ✅ Processed successfully: {processed}")
+            logger.info(f"  ⭕ Skipped (zero positions): {skipped_zero}")
+            logger.info(f"  ❌ Skipped (parse errors): {skipped_parse_error}")
+            logger.info(f"  ❌ Skipped (invalid format): {skipped_invalid}")
+            logger.info(f"  🔍 Skipped (no mapping): {skipped_no_mapping}")
+            logger.info(f"  📋 Total rows analyzed: {len(df_raw) - data_start_row}")
+            
+            if processed == 0:
+                logger.error("❌ NO POSITIONS WERE LOADED! Check if:")
+                logger.error("  1. Contract IDs are in format: FUTSTK-SYMBOL-DATE-TYPE-STRIKE")
+                logger.error("  2. Position column has non-zero values")
+                logger.error("  3. Symbols exist in mapping file")
             
         except Exception as e:
             logger.error(f"Error loading MS Position file: {str(e)}")
@@ -1446,3 +1473,571 @@ class EnhancedPortfolioTransformer:
         
         # Freeze header rows
         ws.freeze_panes = ws['A4']
+    
+    def _create_grouped_sheet_enhanced(self, workbook, sheet_name: str, positions: List) -> None:
+        """Enhanced sheet creation with robust grouping that works for all formats"""
+        
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        
+        ws = workbook.create_sheet(title=sheet_name)
+        
+        # Headers with BBG Price and BBG Deliverable
+        headers = [
+            'Underlying', 'Symbol', 'Expiry', 'Position', 'Type', 'Strike', 
+            'System Deliverable', 'Override Deliverable', 'System Price', 'Override Price', 
+            'BBG Price', 'BBG Deliverable'
+        ]
+        
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True, size=12, color="FFFFFF")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        
+        # Group positions by underlying ticker
+        grouped_positions = {}
+        for position in positions:
+            underlying = position.underlying_ticker
+            if underlying not in grouped_positions:
+                grouped_positions[underlying] = []
+            grouped_positions[underlying].append(position)
+        
+        current_row = 2
+        group_ranges = []
+        
+        # Sort underlyings for consistent output
+        for underlying_ticker in sorted(grouped_positions.keys()):
+            positions_group = grouped_positions[underlying_ticker]
+            underlying_row = current_row
+            
+            # Write underlying summary row
+            ws.cell(row=underlying_row, column=1, value=underlying_ticker)
+            
+            # Get representative position for prices
+            repr_position = positions_group[0]
+            system_price = repr_position.underlying_price
+            if system_price is not None:
+                system_price = round(system_price, 1)
+            ws.cell(row=underlying_row, column=9, value=system_price)  # System Price (Column I)
+            
+            # BBG Price formula
+            bbg_formula = f'=@BDP(A{underlying_row},"PX_LAST")'
+            ws.cell(row=underlying_row, column=11, value=bbg_formula)  # BBG Price (Column K)
+            
+            # Style underlying summary row
+            for col in range(1, 13):  # 12 columns
+                cell = ws.cell(row=underlying_row, column=col)
+                cell.fill = PatternFill(start_color="B8CCE4", end_color="B8CCE4", fill_type="solid")
+                cell.font = Font(bold=True, size=11)
+            
+            current_row += 1
+            detail_start_row = current_row
+            
+            # Write individual positions (sorted by expiry for consistency)
+            for position in sorted(positions_group, key=lambda x: (x.expiry, x.strike, x.option_type)):
+                # Basic data
+                ws.cell(row=current_row, column=2, value=position.bloomberg_ticker)
+                ws.cell(row=current_row, column=3, value=position.expiry.strftime('%Y-%m-%d'))
+                ws.cell(row=current_row, column=4, value=position.position)
+                ws.cell(row=current_row, column=5, value=position.security_type)
+                ws.cell(row=current_row, column=6, value=position.strike if position.strike > 0 else None)
+                
+                # Link prices to underlying row
+                ws.cell(row=current_row, column=9, value=f"=I{underlying_row}")   # System Price
+                ws.cell(row=current_row, column=10, value=f"=J{underlying_row}")  # Override Price
+                ws.cell(row=current_row, column=11, value=f"=K{underlying_row}")  # BBG Price
+                
+                # DELIVERABLE FORMULAS
+                system_formula = self._make_system_formula(current_row, underlying_row, position)
+                override_formula = self._make_override_formula(current_row, underlying_row, position)
+                bbg_formula = self._make_bbg_formula(current_row, underlying_row, position)
+                
+                ws.cell(row=current_row, column=7, value=system_formula)    # System Deliverable
+                ws.cell(row=current_row, column=8, value=override_formula)  # Override Deliverable
+                ws.cell(row=current_row, column=12, value=bbg_formula)      # BBG Deliverable
+                
+                current_row += 1
+            
+            detail_end_row = current_row - 1
+            
+            # Add total formulas to underlying row
+            if detail_end_row >= detail_start_row:
+                ws.cell(row=underlying_row, column=7, value=f"=SUM(G{detail_start_row}:G{detail_end_row})")   # System Total
+                ws.cell(row=underlying_row, column=8, value=f"=SUM(H{detail_start_row}:H{detail_end_row})")   # Override Total
+                ws.cell(row=underlying_row, column=12, value=f"=SUM(L{detail_start_row}:L{detail_end_row})")  # BBG Total
+                
+                # Store group range for later processing
+                group_ranges.append((detail_start_row, detail_end_row))
+            else:
+                # Single position - no detail rows to sum
+                ws.cell(row=underlying_row, column=7, value=0)
+                ws.cell(row=underlying_row, column=8, value=0)
+                ws.cell(row=underlying_row, column=12, value=0)
+        
+        # Apply grouping - Enhanced with better error handling
+        if group_ranges:
+            try:
+                # CRITICAL: Set outline properties BEFORE creating any groups
+                ws.sheet_properties.outlinePr.summaryBelow = False
+                ws.sheet_properties.outlinePr.summaryRight = False
+                
+                # Debug logging
+                logger.info(f"🔧 Applying grouping to {len(group_ranges)} underlying groups in sheet '{sheet_name}'")
+                
+                # Apply grouping to each range
+                successful_groups = 0
+                for start_row, end_row in group_ranges:
+                    try:
+                        if end_row > start_row:
+                            # Multiple rows - create a group
+                            ws.row_dimensions.group(start_row, end_row, hidden=True, outline_level=1)
+                            successful_groups += 1
+                            logger.debug(f"  ✅ Grouped rows {start_row}-{end_row}")
+                        elif end_row == start_row:
+                            # Single row - just hide it
+                            ws.row_dimensions[start_row].hidden = True
+                            successful_groups += 1
+                            logger.debug(f"  ✅ Hid single row {start_row}")
+                    except Exception as group_error:
+                        logger.warning(f"  ⚠️ Could not group rows {start_row}-{end_row}: {str(group_error)}")
+                
+                logger.info(f"✅ Successfully created {successful_groups}/{len(group_ranges)} row groups in sheet '{sheet_name}'")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Could not create row groups in sheet '{sheet_name}': {str(e)}")
+                logger.warning(f"   Sheet will be created without grouping")
+        else:
+            logger.info(f"ℹ️ No groups to create in sheet '{sheet_name}' (single underlying or no data)")
+        
+        # Auto-size columns
+        for col in range(1, 13):
+            ws.column_dimensions[get_column_letter(col)].width = 18
+        
+        # Freeze panes at row 2 (below headers)
+        ws.freeze_panes = ws['A2']
+        
+        logger.info(f"✅ Completed sheet '{sheet_name}' with {len(positions)} positions")
+    
+    def _create_grouped_sheet(self, workbook, sheet_name: str, positions: List) -> None:
+        """Redirect to enhanced version for consistency"""
+        return self._create_grouped_sheet_enhanced(workbook, sheet_name, positions)
+    
+    def _create_unmapped_sheet(self, workbook) -> None:
+        """Create sheet with unmapped symbols for mapping updates"""
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        
+        ws = workbook.create_sheet(title="Unmapped_Symbols")
+        
+        # Headers for unmapped positions
+        headers = [
+            'Symbol', 'Contract ID', 'Position', 'Lot Size', 
+            'Series', 'Expiry', 'Strike', 'Option Type', 
+            'Row Number', 'Suggested Ticker', 'Suggested Cash'
+        ]
+        
+        # Style headers
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True, size=12, color="FFFFFF")
+            cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        
+        # Add unmapped positions
+        unique_symbols = {}
+        current_row = 2
+        
+        for unmapped in self.unmapped_positions:
+            symbol = unmapped['symbol']
+            
+            # Track unique symbols
+            if symbol not in unique_symbols:
+                unique_symbols[symbol] = []
+            unique_symbols[symbol].append(unmapped)
+            
+            # Write position details
+            ws.cell(row=current_row, column=1, value=symbol)
+            ws.cell(row=current_row, column=2, value=unmapped.get('contract_id', ''))
+            ws.cell(row=current_row, column=3, value=unmapped.get('position', 0))
+            ws.cell(row=current_row, column=4, value=unmapped.get('lot_size', 1))
+            ws.cell(row=current_row, column=5, value=unmapped.get('series', ''))
+            ws.cell(row=current_row, column=6, value=unmapped.get('expiry', '').strftime('%Y-%m-%d') if hasattr(unmapped.get('expiry'), 'strftime') else str(unmapped.get('expiry', '')))
+            ws.cell(row=current_row, column=7, value=unmapped.get('strike', 0))
+            ws.cell(row=current_row, column=8, value=unmapped.get('option_type', ''))
+            ws.cell(row=current_row, column=9, value=unmapped.get('row_number', ''))
+            
+            # Suggested mapping (to be filled by user)
+            ws.cell(row=current_row, column=10, value="")  # Suggested ticker
+            ws.cell(row=current_row, column=11, value="")  # Suggested cash ticker
+            
+            # Highlight row
+            for col in range(1, 12):
+                cell = ws.cell(row=current_row, column=col)
+                cell.fill = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
+            
+            current_row += 1
+        
+        # Add summary section
+        current_row += 2
+        ws.cell(row=current_row, column=1, value="SUMMARY")
+        ws.cell(row=current_row, column=1).font = Font(bold=True, size=14)
+        
+        current_row += 1
+        ws.cell(row=current_row, column=1, value="Unique Unmapped Symbols:")
+        ws.cell(row=current_row, column=2, value=len(unique_symbols))
+        
+        current_row += 1
+        ws.cell(row=current_row, column=1, value="Total Unmapped Positions:")
+        ws.cell(row=current_row, column=2, value=len(self.unmapped_positions))
+        
+        current_row += 2
+        ws.cell(row=current_row, column=1, value="UNIQUE SYMBOLS LIST")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        
+        current_row += 1
+        for symbol in sorted(unique_symbols.keys()):
+            ws.cell(row=current_row, column=1, value=symbol)
+            ws.cell(row=current_row, column=2, value=f"{len(unique_symbols[symbol])} positions")
+            current_row += 1
+        
+        # Add instructions
+        current_row += 2
+        instructions = [
+            "INSTRUCTIONS:",
+            "1. Copy the unique symbols from this sheet",
+            "2. Add them to your 'futures mapping.csv' file with correct ticker mappings",
+            "3. Re-run the transformation to include these positions",
+            "",
+            "MAPPING FILE FORMAT:",
+            "Symbol,Ticker,Cash",
+            "LTIM,LTIM,LTIM IS Equity",
+            "RELIANCE,RELIANCE,RELIANCE IS Equity"
+        ]
+        
+        for instruction in instructions:
+            ws.cell(row=current_row, column=1, value=instruction)
+            if instruction.startswith("INSTRUCTIONS:") or instruction.startswith("MAPPING FILE FORMAT:"):
+                ws.cell(row=current_row, column=1).font = Font(bold=True)
+            current_row += 1
+        
+        # Auto-size columns
+        for col in range(1, 12):
+            ws.column_dimensions[get_column_letter(col)].width = 15
+    
+    def _make_system_formula(self, current_row: int, underlying_row: int, position) -> str:
+        """Create system deliverable formula using Column I (system price)"""
+        if position.security_type == "Futures":
+            return f"=D{current_row}"
+        elif position.security_type == "Call":
+            return f'=IF(AND(I{underlying_row}>0,F{current_row}>0),IF(I{underlying_row}>F{current_row},D{current_row},0),D{current_row})'
+        elif position.security_type == "Put":
+            return f'=IF(AND(I{underlying_row}>0,F{current_row}>0),IF(I{underlying_row}<F{current_row},-D{current_row},0),-D{current_row})'
+        return "=0"
+    
+    def _make_override_formula(self, current_row: int, underlying_row: int, position) -> str:
+        """Create override deliverable formula using Column J (manual input)"""
+        if position.security_type == "Futures":
+            return f"=D{current_row}"
+        elif position.security_type == "Call":
+            return f'=IF(J{underlying_row}>0,IF(J{underlying_row}>F{current_row},D{current_row},0),G{current_row})'
+        elif position.security_type == "Put":
+            return f'=IF(J{underlying_row}>0,IF(J{underlying_row}<F{current_row},-D{current_row},0),G{current_row})'
+        return f"=G{current_row}"
+    
+    def _make_bbg_formula(self, current_row: int, underlying_row: int, position) -> str:
+        """Create BBG deliverable formula using Column K (BBG price input)"""
+        if position.security_type == "Futures":
+            return f"=D{current_row}"
+        elif position.security_type == "Call":
+            return f'=IF(K{underlying_row}>0,IF(K{underlying_row}>F{current_row},D{current_row},0),G{current_row})'
+        elif position.security_type == "Put":
+            return f'=IF(K{underlying_row}>0,IF(K{underlying_row}<F{current_row},-D{current_row},0),G{current_row})'
+        return f"=G{current_row}"
+    
+    def get_summary_stats(self) -> Dict:
+        """Get summary statistics including unmapped positions"""
+        if not self.positions and not self.unmapped_positions:
+            return {
+                'total_positions': 0,
+                'total_underlyings': 0,
+                'total_deliverables': 0,
+                'positions_by_type': {},
+                'underlyings_list': [],
+                'input_format': self.input_format or 'unknown',
+                'unmapped_count': 0,
+                'unmapped_symbols': []
+            }
+        
+        total_positions = len(self.positions)
+        total_deliverables = sum(abs(pos.deliverable) for pos in self.positions)
+        underlyings = set(pos.underlying_ticker for pos in self.positions)
+        
+        by_type = {}
+        for pos in self.positions:
+            if pos.security_type not in by_type:
+                by_type[pos.security_type] = 0
+            by_type[pos.security_type] += 1
+        
+        # Get unique unmapped symbols
+        unmapped_symbols = list(set(pos['symbol'] for pos in self.unmapped_positions)) if self.unmapped_positions else []
+        
+        return {
+            'total_positions': total_positions,
+            'total_underlyings': len(underlyings),
+            'total_deliverables': total_deliverables,
+            'positions_by_type': by_type,
+            'underlyings_list': sorted(underlyings),
+            'input_format': self.input_format,
+            'unmapped_count': len(self.unmapped_positions),
+            'unmapped_symbols': sorted(unmapped_symbols)
+        }
+    
+    # Helper methods
+    def _parse_date(self, date_value) -> datetime:
+        """Parse various date formats"""
+        if pd.isna(date_value):
+            return datetime.now()
+        
+        if isinstance(date_value, datetime):
+            return date_value
+        
+        if isinstance(date_value, (int, float)):
+            # Excel serial date
+            try:
+                return pd.to_datetime('1900-01-01') + pd.Timedelta(days=date_value-2)
+            except:
+                return datetime.now()
+        
+        if isinstance(date_value, str):
+            try:
+                return pd.to_datetime(date_value)
+            except:
+                return datetime.now()
+        
+        return datetime.now()
+    
+    def _generate_bloomberg_ticker(self, symbol: str, fo_ticker: str, series: str, 
+                                 expiry: datetime, strike: float, option_type: str) -> str:
+        """Generate Bloomberg ticker format"""
+        try:
+            is_future = series == 'FUTSTK' or option_type == 'FF'
+            
+            if is_future:
+                # Futures format
+                month_code = self._get_month_code(expiry.month)
+                year_digit = str(expiry.year)[-1]
+                return f"{fo_ticker}={month_code}{year_digit} IS Equity"
+            else:
+                # Options format
+                expiry_str = expiry.strftime('%m/%d/%y')
+                
+                if option_type in ['CE', 'C']:
+                    option_char = 'C'
+                elif option_type in ['PE', 'P']:
+                    option_char = 'P'
+                else:
+                    option_char = 'C'  # Default
+                
+                strike_str = str(int(strike)) if strike > 0 else '0'
+                
+                return f"{fo_ticker} IS {expiry_str} {option_char}{strike_str} Equity"
+                
+        except Exception as e:
+            logger.warning(f"Error generating Bloomberg ticker for {symbol}: {str(e)}")
+            return f"{fo_ticker} IS Equity"
+    
+    def _get_month_code(self, month: int) -> str:
+        """Get futures month code"""
+        month_codes = {
+            1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+            7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+        }
+        return month_codes.get(month, 'Z')
+    
+    def _get_security_type(self, series: str, option_type: str) -> str:
+        """Determine security type"""
+        if series == 'FUTSTK' or option_type == 'FF':
+            return 'Futures'
+        elif option_type in ['CE', 'C']:
+            return 'Call'
+        elif option_type in ['PE', 'P']:
+            return 'Put'
+        else:
+            return 'Unknown'
+    
+    def _is_in_the_money(self, option_type: str, strike: float, underlying_price: float) -> bool:
+        """Determine if option is in-the-money"""
+        if option_type in ['CE', 'Call', 'C']:
+            return underlying_price > strike
+        elif option_type in ['PE', 'Put', 'P']:
+            return underlying_price < strike
+        else:
+            return False
+
+
+def send_email_report(output_file: str, stats: Dict, recipients: List[str]) -> bool:
+    """Send email report with Excel attachment"""
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.base import MIMEBase
+        from email import encoders
+        import os
+        
+        # Email configuration (you'll need to set these)
+        SMTP_SERVER = "smtp.gmail.com"  # Change for your email provider
+        SMTP_PORT = 587
+        SENDER_EMAIL = os.environ.get('SENDER_EMAIL', '')  # Set environment variable
+        SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', '')  # Set environment variable
+        
+        if not SENDER_EMAIL or not SENDER_PASSWORD:
+            logger.warning("Email credentials not configured. Set SENDER_EMAIL and SENDER_PASSWORD environment variables.")
+            return False
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = ', '.join(recipients)
+        msg['Subject'] = f"Portfolio Transformation Report - {datetime.now().strftime('%Y-%m-%d')}"
+        
+        # Email body
+        body = f"""
+Portfolio Transformation Report
+
+Summary:
+- Input Format: {stats['input_format']}
+- Total Positions Processed: {stats['total_positions']}
+- Total Underlyings: {stats['total_underlyings']}
+- Positions by Type: {stats['positions_by_type']}
+
+Unmapped Symbols: {stats.get('unmapped_count', 0)}
+{f"Symbols needing mapping: {', '.join(stats.get('unmapped_symbols', [])[:5])}" if stats.get('unmapped_count', 0) > 0 else ''}
+
+The detailed Excel report is attached.
+
+Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Attach Excel file
+        with open(output_file, "rb") as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                'Content-Disposition',
+                f'attachment; filename= {os.path.basename(output_file)}'
+            )
+            msg.attach(part)
+        
+        # Send email
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        logger.info(f"✅ Email sent successfully to {', '.join(recipients)}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send email: {str(e)}")
+        return False
+
+
+def main():
+    """Main function with streamlined workflow"""
+    try:
+        print("🚀 UNIVERSAL PORTFOLIO TRANSFORMER V3.1 - FIXED VERSION")
+        print("=" * 60)
+        print("✅ Supports 3 input formats with smart detection")
+        print("✅ Flexible start row detection for all formats")
+        print("✅ Auto-loads mapping")
+        print("✅ Auto-fetches prices")
+        print("✅ Bloomberg integration")
+        print("✅ Password protection")
+        print("✅ Net position summary")
+        print("✅ Price alerts for options")
+        print("✅ Consistent output and grouping for ALL formats")
+        print("=" * 60)
+        
+        # Step 1: Select Fund
+        fund_name = select_fund()
+        
+        # Step 2: Select input file
+        input_file = select_file_from_directory("position data", ['.csv', '.xlsx', '.xls'])
+        
+        # Step 3: Generate output filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f"{fund_name}_{timestamp}.xlsx"
+        
+        # Step 4: Initialize transformer
+        print(f"\n📄 PROCESSING {fund_name} PORTFOLIO...")
+        transformer = EnhancedPortfolioTransformer(fund_name)
+        
+        # Step 5: Load mapping (auto)
+        print("📋 Loading futures mapping...")
+        transformer.load_mapping_data()
+        
+        # Step 6: Load positions (auto-detect format with improved logic)
+        print("📋 Loading positions (smart format detection)...")
+        transformer.load_positions(input_file)
+        
+        # Step 7: Calculate deliverables (auto-fetch prices)
+        print("🧮 Calculating deliverables and fetching prices...")
+        transformer.calculate_deliverables(auto_fetch_prices=True)
+        
+        # Step 8: Save output
+        print("💾 Generating Excel output...")
+        transformer.save_output_excel(output_file)
+        
+        # Step 9: Print summary
+        stats = transformer.get_summary_stats()
+        print(f"\n🎉 TRANSFORMATION COMPLETED SUCCESSFULLY!")
+        print(f"   📁 Fund: {fund_name}")
+        print(f"   📊 Input format: {stats['input_format']}")
+        print(f"   📈 Total positions: {stats['total_positions']}")
+        print(f"   🏢 Total underlyings: {stats['total_underlyings']}")
+        print(f"   📋 Positions by type: {stats['positions_by_type']}")
+        
+        # Show unmapped symbols if any
+        if stats.get('unmapped_count', 0) > 0:
+            print(f"\n   ⚠️ UNMAPPED SYMBOLS: {stats['unmapped_count']} positions")
+            print(f"   🔍 Unique symbols without mapping: {len(stats['unmapped_symbols'])}")
+            print(f"   🔍 Check 'Unmapped_Symbols' sheet in output file")
+            print(f"   Unmapped symbols: {', '.join(stats['unmapped_symbols'][:10])}")
+            if len(stats['unmapped_symbols']) > 10:
+                print(f"   ... and {len(stats['unmapped_symbols']) - 10} more")
+        
+        print(f"   💾 Output saved to: {output_file}")
+        
+        print(f"\n🔧 FEATURES INCLUDED:")
+        print(f"   ✅ Smart format detection: {stats['input_format']}")
+        print(f"   ✅ Yahoo Finance prices fetched")
+        print(f"   ✅ Bloomberg formulas: =@BDP(underlying,\"PX_LAST\")")
+        print(f"   ✅ Excel formulas for deliverable calculations")
+        print(f"   ✅ Collapsible grouped rows by underlying")
+        print(f"   ✅ Net position summary sheet")
+        print(f"   ✅ Price alert sheet with configurable threshold")
+        print(f"   ✅ Consistent output for all input formats")
+        
+        # Show sample positions
+        if transformer.positions:
+            print(f"\n📊 SAMPLE PROCESSED POSITIONS:")
+            for i, pos in enumerate(transformer.positions[:3]):
+                print(f"   {i+1}. {pos.symbol} ({pos.security_type}) - {pos.position} lots (Lot Size: {pos.lot_size})")
+        
+    except KeyboardInterrupt:
+        print("\n❌ Transformation cancelled by user")
+    except SystemExit:
+        print("❌ Transformation stopped")
+    except Exception as e:
+        print(f"\n❌ ERROR: {str(e)}")
+        logger.error(f"Error in main execution: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
