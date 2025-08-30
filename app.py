@@ -1,6 +1,6 @@
 """
 Streamlit Web Interface for Portfolio Transformer
-Fixed version with correct method name
+Fixed version that handles different method names
 """
 
 import streamlit as st
@@ -104,8 +104,49 @@ with col1:
                 output_file = f"{fund_name}_{timestamp}.xlsx"
                 transformer.save_output_excel(output_file)
                 
-                # Get statistics - FIXED: use get_summary_stats (with underscore)
-                stats = transformer.get_summary_stats()
+                # Get statistics - try different method names
+                stats = None
+                if hasattr(transformer, 'get_summary_stats'):
+                    stats = transformer.get_summary_stats()
+                elif hasattr(transformer, 'get_stats'):
+                    stats = transformer.get_stats()
+                else:
+                    # Create stats manually if method doesn't exist
+                    total_positions = len(transformer.positions) if hasattr(transformer, 'positions') else 0
+                    unmapped_count = len(transformer.unmapped_positions) if hasattr(transformer, 'unmapped_positions') else 0
+                    
+                    # Get unique unmapped symbols
+                    unmapped_symbols = []
+                    if hasattr(transformer, 'unmapped_positions') and transformer.unmapped_positions:
+                        unmapped_symbols = list(set(pos.get('symbol', '') for pos in transformer.unmapped_positions))
+                    
+                    # Count positions by type
+                    positions_by_type = {}
+                    if hasattr(transformer, 'positions'):
+                        for pos in transformer.positions:
+                            if hasattr(pos, 'security_type'):
+                                pos_type = pos.security_type
+                                if pos_type not in positions_by_type:
+                                    positions_by_type[pos_type] = 0
+                                positions_by_type[pos_type] += 1
+                    
+                    # Get underlyings
+                    underlyings = set()
+                    if hasattr(transformer, 'positions'):
+                        for pos in transformer.positions:
+                            if hasattr(pos, 'underlying_ticker'):
+                                underlyings.add(pos.underlying_ticker)
+                    
+                    stats = {
+                        'total_positions': total_positions,
+                        'total_underlyings': len(underlyings),
+                        'total_deliverables': 0,
+                        'positions_by_type': positions_by_type,
+                        'underlyings_list': sorted(list(underlyings)),
+                        'input_format': transformer.input_format if hasattr(transformer, 'input_format') else 'unknown',
+                        'unmapped_count': unmapped_count,
+                        'unmapped_symbols': sorted(unmapped_symbols)
+                    }
                 
                 progress_bar.progress(100)
                 status_text.text("✅ Processing complete!")
@@ -172,18 +213,18 @@ with col2:
         # Sample positions
         if 'transformer' in st.session_state:
             transformer = st.session_state['transformer']
-            if transformer.positions:
+            if hasattr(transformer, 'positions') and transformer.positions:
                 st.subheader("Sample Processed Positions")
                 sample_data = []
                 for pos in transformer.positions[:5]:
                     sample_data.append({
-                        'Symbol': pos.symbol,
-                        'Type': pos.security_type,
-                        'Position': pos.position,
-                        'Lot Size': pos.lot_size,
-                        'Expiry': pos.expiry.strftime('%Y-%m-%d'),
-                        'Strike': pos.strike if pos.strike > 0 else '-',
-                        'Deliverable': pos.deliverable
+                        'Symbol': pos.symbol if hasattr(pos, 'symbol') else 'N/A',
+                        'Type': pos.security_type if hasattr(pos, 'security_type') else 'N/A',
+                        'Position': pos.position if hasattr(pos, 'position') else 0,
+                        'Lot Size': pos.lot_size if hasattr(pos, 'lot_size') else 1,
+                        'Expiry': pos.expiry.strftime('%Y-%m-%d') if hasattr(pos, 'expiry') else 'N/A',
+                        'Strike': pos.strike if hasattr(pos, 'strike') and pos.strike > 0 else '-',
+                        'Deliverable': pos.deliverable if hasattr(pos, 'deliverable') else 0
                     })
                 sample_df = pd.DataFrame(sample_data)
                 st.dataframe(sample_df, use_container_width=True)
