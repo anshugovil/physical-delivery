@@ -1189,6 +1189,14 @@ class EnhancedPortfolioTransformer:
             
             # Create sheets for mapped positions if any exist
             if self.positions:
+                # Create Net Position Summary sheet FIRST
+                self._create_net_position_summary(wb, self.positions)
+                logger.info(f"✅ Created Net Position Summary sheet")
+                
+                # Create Price Alert sheet
+                self._create_price_alert_sheet(wb, self.positions)
+                logger.info(f"✅ Created Price Alert sheet")
+                
                 # Group positions by expiry date
                 expiry_groups = {}
                 for position in self.positions:
@@ -1197,7 +1205,7 @@ class EnhancedPortfolioTransformer:
                         expiry_groups[expiry_key] = []
                     expiry_groups[expiry_key].append(position)
                 
-                # Create master sheet with ALL positions first
+                # Create master sheet with ALL positions
                 self._create_grouped_sheet(wb, "Master_All_Expiries", self.positions)
                 logger.info(f"✅ Created Master sheet with {len(self.positions)} positions")
                 
@@ -1225,6 +1233,211 @@ class EnhancedPortfolioTransformer:
         except Exception as e:
             logger.error(f"Error saving Excel file: {str(e)}")
             raise
+    
+    def _create_net_position_summary(self, workbook, positions: List) -> None:
+        """Create net position summary sheet showing deliverables by underlying"""
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        
+        ws = workbook.create_sheet(title="Net_Position_Summary", index=0)
+        
+        # Headers
+        headers = [
+            'Underlying', 'Total Contracts', 'Total Lots', 'Lot Size',
+            'System Deliverable', 'Override Deliverable', 'BBG Deliverable',
+            'System Price', 'Override Price', 'BBG Price'
+        ]
+        
+        # Style headers
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True, size=12, color="FFFFFF")
+            cell.fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center")
+        
+        # Aggregate positions by underlying
+        underlying_summary = {}
+        for position in positions:
+            underlying = position.underlying_ticker
+            if underlying not in underlying_summary:
+                underlying_summary[underlying] = {
+                    'positions': [],
+                    'total_contracts': 0,
+                    'total_lots': 0,
+                    'lot_size': position.lot_size,  # Store lot size
+                    'system_price': position.underlying_price
+                }
+            underlying_summary[underlying]['positions'].append(position)
+            underlying_summary[underlying]['total_contracts'] += 1
+            underlying_summary[underlying]['total_lots'] += abs(position.position)
+        
+        # Write summary data
+        current_row = 2
+        for underlying in sorted(underlying_summary.keys()):
+            data = underlying_summary[underlying]
+            
+            # Underlying name
+            ws.cell(row=current_row, column=1, value=underlying)
+            
+            # Contract count and lots
+            ws.cell(row=current_row, column=2, value=data['total_contracts'])
+            ws.cell(row=current_row, column=3, value=data['total_lots'])
+            ws.cell(row=current_row, column=4, value=data['lot_size'])
+            
+            # System deliverable (sum from all positions)
+            system_deliverable = sum(pos.deliverable for pos in data['positions'])
+            ws.cell(row=current_row, column=5, value=system_deliverable)
+            
+            # Formulas for Override and BBG deliverables (referencing Master sheet)
+            # These will pull from the grouped sheets
+            ws.cell(row=current_row, column=6, value=f"=SUMIF(Master_All_Expiries!A:A,A{current_row},Master_All_Expiries!H:H)")
+            ws.cell(row=current_row, column=7, value=f"=SUMIF(Master_All_Expiries!A:A,A{current_row},Master_All_Expiries!L:L)")
+            
+            # Prices
+            ws.cell(row=current_row, column=8, value=data['system_price'])
+            ws.cell(row=current_row, column=9, value="")  # Override price (manual input)
+            ws.cell(row=current_row, column=10, value=f'=@BDP(A{current_row},"PX_LAST")')  # BBG price
+            
+            # Highlight row based on deliverable size
+            if abs(system_deliverable) > 100:
+                for col in range(1, 11):
+                    ws.cell(row=current_row, column=col).fill = PatternFill(
+                        start_color="FFE6E6", end_color="FFE6E6", fill_type="solid"
+                    )
+            
+            current_row += 1
+        
+        # Add totals row
+        total_row = current_row + 1
+        ws.cell(row=total_row, column=1, value="TOTAL")
+        ws.cell(row=total_row, column=1).font = Font(bold=True, size=12)
+        
+        # Total formulas
+        ws.cell(row=total_row, column=2, value=f"=SUM(B2:B{current_row-1})")
+        ws.cell(row=total_row, column=3, value=f"=SUM(C2:C{current_row-1})")
+        ws.cell(row=total_row, column=5, value=f"=SUM(E2:E{current_row-1})")
+        ws.cell(row=total_row, column=6, value=f"=SUM(F2:F{current_row-1})")
+        ws.cell(row=total_row, column=7, value=f"=SUM(G2:G{current_row-1})")
+        
+        # Style total row
+        for col in range(1, 11):
+            cell = ws.cell(row=total_row, column=col)
+            cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+            cell.font = Font(bold=True)
+        
+        # Auto-size columns
+        for col in range(1, 11):
+            ws.column_dimensions[get_column_letter(col)].width = 18
+        
+        # Freeze top row
+        ws.freeze_panes = ws['A2']
+    
+    def _create_price_alert_sheet(self, workbook, positions: List) -> None:
+        """Create price alert sheet for positions near strike price"""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        from openpyxl.formatting.rule import CellIsRule
+        
+        ws = workbook.create_sheet(title="Price_Alerts", index=1)
+        
+        # Add threshold input cell
+        ws.cell(row=1, column=1, value="Alert Threshold (%):")
+        ws.cell(row=1, column=1).font = Font(bold=True)
+        ws.cell(row=1, column=2, value=1.0)  # Default 1%
+        ws.cell(row=1, column=2).fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        
+        # Headers
+        headers = [
+            'Underlying', 'Symbol', 'Type', 'Strike', 'Current Price',
+            'Moneyness %', 'Days to Expiry', 'Position', 'Alert Status'
+        ]
+        
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=3, column=col, value=header)
+            cell.font = Font(bold=True, size=11, color="FFFFFF")
+            cell.fill = PatternFill(start_color="FF6600", end_color="FF6600", fill_type="solid")
+        
+        # Filter for options only
+        options_positions = [pos for pos in positions if pos.security_type in ['Call', 'Put']]
+        
+        current_row = 4
+        today = datetime.now()
+        
+        for position in sorted(options_positions, key=lambda x: (x.underlying_ticker, x.expiry)):
+            # Basic info
+            ws.cell(row=current_row, column=1, value=position.underlying_ticker)
+            ws.cell(row=current_row, column=2, value=position.bloomberg_ticker)
+            ws.cell(row=current_row, column=3, value=position.security_type)
+            ws.cell(row=current_row, column=4, value=position.strike)
+            
+            # Current price (formula to reference Net Position Summary)
+            price_formula = f"=VLOOKUP(A{current_row},Net_Position_Summary!A:H,8,FALSE)"
+            ws.cell(row=current_row, column=5, value=price_formula)
+            
+            # Moneyness % calculation
+            if position.security_type == "Call":
+                moneyness_formula = f"=IF(E{current_row}>0,(E{current_row}-D{current_row})/D{current_row}*100,0)"
+            else:  # Put
+                moneyness_formula = f"=IF(E{current_row}>0,(D{current_row}-E{current_row})/D{current_row}*100,0)"
+            ws.cell(row=current_row, column=6, value=moneyness_formula)
+            
+            # Days to expiry
+            days_to_expiry = (position.expiry - today).days
+            ws.cell(row=current_row, column=7, value=days_to_expiry)
+            
+            # Position
+            ws.cell(row=current_row, column=8, value=position.position)
+            
+            # Alert Status formula
+            alert_formula = f'=IF(ABS(F{current_row})<=$B$1,"🔴 NEAR STRIKE",IF(ABS(F{current_row})<=($B$1*2),"🟡 WATCH","🟢 SAFE"))'
+            ws.cell(row=current_row, column=9, value=alert_formula)
+            
+            # Conditional formatting for alert rows
+            if position.underlying_price:
+                moneyness = abs((position.underlying_price - position.strike) / position.strike * 100)
+                if moneyness <= 1.0:
+                    for col in range(1, 10):
+                        ws.cell(row=current_row, column=col).fill = PatternFill(
+                            start_color="FFB3B3", end_color="FFB3B3", fill_type="solid"
+                        )
+                elif moneyness <= 2.0:
+                    for col in range(1, 10):
+                        ws.cell(row=current_row, column=col).fill = PatternFill(
+                            start_color="FFFFCC", end_color="FFFFCC", fill_type="solid"
+                        )
+            
+            # Highlight if expiring soon (within 7 days)
+            if days_to_expiry <= 7:
+                ws.cell(row=current_row, column=7).fill = PatternFill(
+                    start_color="FF0000", end_color="FF0000", fill_type="solid"
+                )
+                ws.cell(row=current_row, column=7).font = Font(color="FFFFFF", bold=True)
+            
+            current_row += 1
+        
+        # Add summary statistics
+        summary_row = current_row + 2
+        ws.cell(row=summary_row, column=1, value="SUMMARY")
+        ws.cell(row=summary_row, column=1).font = Font(bold=True, size=12)
+        
+        summary_row += 1
+        ws.cell(row=summary_row, column=1, value="Total Options:")
+        ws.cell(row=summary_row, column=2, value=len(options_positions))
+        
+        summary_row += 1
+        ws.cell(row=summary_row, column=1, value="Positions < 1% from strike:")
+        ws.cell(row=summary_row, column=2, value=f'=COUNTIF(I4:I{current_row-1},"*NEAR*")')
+        
+        summary_row += 1
+        ws.cell(row=summary_row, column=1, value="Expiring within 7 days:")
+        ws.cell(row=summary_row, column=2, value=f'=COUNTIF(G4:G{current_row-1},"<=7")')
+        
+        # Auto-size columns
+        for col in range(1, 10):
+            ws.column_dimensions[get_column_letter(col)].width = 15
+        
+        # Freeze header rows
+        ws.freeze_panes = ws['A4']
     
     def _create_unmapped_sheet(self, workbook) -> None:
         """Create sheet with unmapped symbols for mapping updates"""
@@ -1597,6 +1810,78 @@ class EnhancedPortfolioTransformer:
             return False
 
 
+def send_email_report(output_file: str, stats: Dict, recipients: List[str]) -> bool:
+    """Send email report with Excel attachment"""
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.base import MIMEBase
+        from email import encoders
+        import os
+        
+        # Email configuration (you'll need to set these)
+        SMTP_SERVER = "smtp.gmail.com"  # Change for your email provider
+        SMTP_PORT = 587
+        SENDER_EMAIL = os.environ.get('SENDER_EMAIL', '')  # Set environment variable
+        SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', '')  # Set environment variable
+        
+        if not SENDER_EMAIL or not SENDER_PASSWORD:
+            logger.warning("Email credentials not configured. Set SENDER_EMAIL and SENDER_PASSWORD environment variables.")
+            return False
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = ', '.join(recipients)
+        msg['Subject'] = f"Portfolio Transformation Report - {datetime.now().strftime('%Y-%m-%d')}"
+        
+        # Email body
+        body = f"""
+Portfolio Transformation Report
+
+Summary:
+- Input Format: {stats['input_format']}
+- Total Positions Processed: {stats['total_positions']}
+- Total Underlyings: {stats['total_underlyings']}
+- Positions by Type: {stats['positions_by_type']}
+
+Unmapped Symbols: {stats.get('unmapped_count', 0)}
+{f"Symbols needing mapping: {', '.join(stats.get('unmapped_symbols', [])[:5])}" if stats.get('unmapped_count', 0) > 0 else ''}
+
+The detailed Excel report is attached.
+
+Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Attach Excel file
+        with open(output_file, "rb") as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                'Content-Disposition',
+                f'attachment; filename= {os.path.basename(output_file)}'
+            )
+            msg.attach(part)
+        
+        # Send email
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        logger.info(f"✅ Email sent successfully to {', '.join(recipients)}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send email: {str(e)}")
+        return False
+
+
 def main():
     """Main function with streamlined workflow"""
     try:
@@ -1608,6 +1893,8 @@ def main():
         print("✅ Auto-fetches prices")
         print("✅ Bloomberg integration")
         print("✅ Password protection")
+        print("✅ Net position summary")
+        print("✅ Price alerts for options")
         print("=" * 60)
         
         # Step 1: Select Fund
@@ -1660,18 +1947,42 @@ def main():
         
         print(f"   💾 Output saved to: {output_file}")
         
+        # Step 10: Ask about email
+        send_email = input("\n📧 Send email report? (y/n): ").strip().lower()
+        if send_email == 'y':
+            recipients_input = input("Enter email addresses (comma-separated): ").strip()
+            if recipients_input:
+                recipients = [email.strip() for email in recipients_input.split(',')]
+                print("📧 Sending email report...")
+                if send_email_report(output_file, stats, recipients):
+                    print("✅ Email sent successfully!")
+                else:
+                    print("❌ Email sending failed. Check configuration.")
+        
         print(f"\n🔧 FEATURES INCLUDED:")
         print(f"   ✅ Smart format detection: {stats['input_format']}")
         print(f"   ✅ Yahoo Finance prices fetched")
         print(f"   ✅ Bloomberg formulas: =@BDP(underlying,\"PX_LAST\")")
         print(f"   ✅ Excel formulas for deliverable calculations")
         print(f"   ✅ Collapsible grouped rows by underlying")
+        print(f"   ✅ Net position summary sheet")
+        print(f"   ✅ Price alert sheet with configurable threshold")
         
         # Show sample positions
         if transformer.positions:
             print(f"\n📊 SAMPLE PROCESSED POSITIONS:")
             for i, pos in enumerate(transformer.positions[:3]):
-                print(f"   {i+1}. {pos.symbol} ({pos.security_type}) - {pos.position} lots")
+                print(f"   {i+1}. {pos.symbol} ({pos.security_type}) - {pos.position} lots (Lot Size: {pos.lot_size})")
+        
+    except KeyboardInterrupt:
+        print("\n❌ Transformation cancelled by user")
+    except SystemExit:
+        print("❌ Transformation stopped")
+    except Exception as e:
+        print(f"\n❌ ERROR: {str(e)}")
+        logger.error(f"Error in main execution: {str(e)}")
+        import traceback
+        traceback.print_exc()
         
     except KeyboardInterrupt:
         print("\n❌ Transformation cancelled by user")
