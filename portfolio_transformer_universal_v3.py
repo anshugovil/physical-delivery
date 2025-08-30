@@ -233,6 +233,7 @@ class EnhancedPortfolioTransformer:
         self.fund_name = fund_name
         self.mapping_data = {}
         self.positions = []
+        self.unmapped_positions = []  # Track positions without mappings
         self.underlying_prices = {}
         self.price_overrides = {}
         self.bbg_price_overrides = {}
@@ -469,6 +470,7 @@ class EnhancedPortfolioTransformer:
                 raise ValueError(f"Could not identify required columns: {missing}")
             
             positions = []
+            unmapped_positions = []
             skipped_zero = 0
             skipped_parse_error = 0
             skipped_no_mapping = 0
@@ -494,10 +496,22 @@ class EnhancedPortfolioTransformer:
                     
                     symbol = parsed_data['symbol']
                     
-                    # Get mapping info
+                    # Check mapping
                     if symbol not in self.mapping_data:
                         logger.warning(f"No mapping found for symbol: '{symbol}' (row {idx+2})")
                         skipped_no_mapping += 1
+                        # Store unmapped position details
+                        unmapped_positions.append({
+                            'symbol': symbol,
+                            'contract_id': contract_id,
+                            'position': cf_lots,
+                            'lot_size': lot_size,
+                            'series': parsed_data['series'],
+                            'expiry': parsed_data['expiry'],
+                            'strike': parsed_data['strike'],
+                            'option_type': parsed_data['option_type'],
+                            'row_number': idx + 2
+                        })
                         continue
                     
                     mapping_info = self.mapping_data[symbol]
@@ -535,6 +549,7 @@ class EnhancedPortfolioTransformer:
                     continue
             
             self.positions = positions
+            self.unmapped_positions = unmapped_positions
             self._print_processing_summary(processed, skipped_zero, skipped_parse_error, skipped_no_mapping, len(df))
             
         except Exception as e:
@@ -637,6 +652,19 @@ class EnhancedPortfolioTransformer:
                     if symbol not in self.mapping_data:
                         logger.warning(f"No mapping found for symbol: '{symbol}' (row {idx+2})")
                         skipped_no_mapping += 1
+                        # Store unmapped position details
+                        self.unmapped_positions.append({
+                            'symbol': symbol,
+                            'contract_id': contract_id,
+                            'position': cf_lots,
+                            'lot_size': lot_size,
+                            'series': parsed_data['series'],
+                            'expiry': parsed_data['expiry'],
+                            'strike': parsed_data['strike'],
+                            'option_type': parsed_data['option_type'],
+                            'row_number': idx + 2,
+                            'source': 'Excel Contract Format'
+                        })
                         continue
                     
                     mapping_info = self.mapping_data[symbol]
@@ -765,6 +793,19 @@ class EnhancedPortfolioTransformer:
                     if symbol not in self.mapping_data:
                         logger.warning(f"No mapping found for symbol: '{symbol}' (row {idx + 1})")
                         skipped_no_mapping += 1
+                        # Store unmapped position details
+                        self.unmapped_positions.append({
+                            'symbol': symbol,
+                            'contract_id': contract_id,
+                            'position': open_pos,
+                            'lot_size': 1,
+                            'series': parsed_data['series'],
+                            'expiry': parsed_data['expiry'],
+                            'strike': parsed_data['strike'],
+                            'option_type': parsed_data['option_type'],
+                            'row_number': idx + 1,
+                            'source': 'MS Position Format'
+                        })
                         continue
                     
                     mapping_info = self.mapping_data[symbol]
@@ -900,6 +941,19 @@ class EnhancedPortfolioTransformer:
                     if symbol not in self.mapping_data:
                         logger.warning(f"No mapping found for symbol: {symbol} (row {idx + 1})")
                         skipped_no_mapping += 1
+                        # Store unmapped position details
+                        self.unmapped_positions.append({
+                            'symbol': symbol,
+                            'contract_id': f"{symbol}-{series}-{expiry.strftime('%d%b%Y').upper()}-{option_type}-{strike}",
+                            'position': open_position,
+                            'lot_size': lot_size,
+                            'series': series,
+                            'expiry': expiry,
+                            'strike': strike,
+                            'option_type': option_type,
+                            'row_number': idx + 1,
+                            'source': 'BOD Format'
+                        })
                         continue
                     
                     mapping_info = self.mapping_data[symbol]
@@ -951,6 +1005,13 @@ class EnhancedPortfolioTransformer:
         logger.info(f"  ❌ Skipped (parse errors): {skipped_parse_error}")
         logger.info(f"  🔍 Skipped (no mapping): {skipped_no_mapping}")
         logger.info(f"  📋 Total rows analyzed: {total_rows}")
+        
+        # Add unmapped positions count
+        if hasattr(self, 'unmapped_positions') and self.unmapped_positions:
+            logger.info(f"  ⚠️ Unmapped positions stored: {len(self.unmapped_positions)}")
+            unique_unmapped = set(pos['symbol'] for pos in self.unmapped_positions)
+            logger.info(f"  📝 Unique unmapped symbols: {len(unique_unmapped)}")
+            logger.info(f"     First few: {list(unique_unmapped)[:5]}")
     
     def _parse_contract_id(self, contract_id: str) -> Optional[Dict]:
         """Parse contract ID string to extract components"""
@@ -1109,13 +1170,16 @@ class EnhancedPortfolioTransformer:
                 position.deliverable = 0.0
     
     def save_output_excel(self, output_path: str) -> None:
-        """Save output to Excel file with formulas and grouping"""
+        """Save output to Excel file with formulas, grouping, and unmapped symbols sheet"""
         try:
             import openpyxl
             from openpyxl.utils import get_column_letter
             from openpyxl.styles import Font, PatternFill
             
-            if not self.positions:
+            # Debug logging
+            logger.info(f"📊 Saving output: {len(self.positions)} mapped positions, {len(self.unmapped_positions)} unmapped positions")
+            
+            if not self.positions and not self.unmapped_positions:
                 logger.warning("No positions to export")
                 return
             
@@ -1123,26 +1187,36 @@ class EnhancedPortfolioTransformer:
             wb = openpyxl.Workbook()
             wb.remove(wb.active)
             
-            # Group positions by expiry date
-            expiry_groups = {}
-            for position in self.positions:
-                expiry_key = position.expiry.strftime('%Y-%m-%d')
-                if expiry_key not in expiry_groups:
-                    expiry_groups[expiry_key] = []
-                expiry_groups[expiry_key].append(position)
-            
-            # Create master sheet with ALL positions first
-            self._create_grouped_sheet(wb, "Master_All_Expiries", self.positions)
-            logger.info(f"✅ Created Master sheet with {len(self.positions)} positions")
-            
-            # Create individual expiry sheets
-            for expiry_date, positions in sorted(expiry_groups.items()):
-                sheet_name = f"Expiry_{expiry_date.replace('-', '_')}"
-                if len(sheet_name) > 31:
-                    sheet_name = f"Exp_{expiry_date.replace('-', '_')}"
+            # Create sheets for mapped positions if any exist
+            if self.positions:
+                # Group positions by expiry date
+                expiry_groups = {}
+                for position in self.positions:
+                    expiry_key = position.expiry.strftime('%Y-%m-%d')
+                    if expiry_key not in expiry_groups:
+                        expiry_groups[expiry_key] = []
+                    expiry_groups[expiry_key].append(position)
                 
-                self._create_grouped_sheet(wb, sheet_name, positions)
-                logger.info(f"✅ Created sheet '{sheet_name}' with {len(positions)} positions")
+                # Create master sheet with ALL positions first
+                self._create_grouped_sheet(wb, "Master_All_Expiries", self.positions)
+                logger.info(f"✅ Created Master sheet with {len(self.positions)} positions")
+                
+                # Create individual expiry sheets
+                for expiry_date, positions in sorted(expiry_groups.items()):
+                    sheet_name = f"Expiry_{expiry_date.replace('-', '_')}"
+                    if len(sheet_name) > 31:
+                        sheet_name = f"Exp_{expiry_date.replace('-', '_')}"
+                    
+                    self._create_grouped_sheet(wb, sheet_name, positions)
+                    logger.info(f"✅ Created sheet '{sheet_name}' with {len(positions)} positions")
+            
+            # Create unmapped symbols sheet if there are any
+            if self.unmapped_positions:
+                logger.info(f"⚠️ Creating unmapped sheet with {len(self.unmapped_positions)} positions")
+                self._create_unmapped_sheet(wb)
+                logger.info(f"✅ Created 'Unmapped_Symbols' sheet with {len(self.unmapped_positions)} positions")
+            else:
+                logger.info("ℹ️ No unmapped positions found - all symbols had mappings")
             
             # Save workbook
             wb.save(output_path)
@@ -1151,6 +1225,107 @@ class EnhancedPortfolioTransformer:
         except Exception as e:
             logger.error(f"Error saving Excel file: {str(e)}")
             raise
+    
+    def _create_unmapped_sheet(self, workbook) -> None:
+        """Create sheet with unmapped symbols for mapping updates"""
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        
+        ws = workbook.create_sheet(title="Unmapped_Symbols")
+        
+        # Headers for unmapped positions
+        headers = [
+            'Symbol', 'Contract ID', 'Position', 'Lot Size', 
+            'Series', 'Expiry', 'Strike', 'Option Type', 
+            'Row Number', 'Suggested Ticker', 'Suggested Cash'
+        ]
+        
+        # Style headers
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True, size=12, color="FFFFFF")
+            cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        
+        # Add unmapped positions
+        unique_symbols = {}
+        current_row = 2
+        
+        for unmapped in self.unmapped_positions:
+            symbol = unmapped['symbol']
+            
+            # Track unique symbols
+            if symbol not in unique_symbols:
+                unique_symbols[symbol] = []
+            unique_symbols[symbol].append(unmapped)
+            
+            # Write position details
+            ws.cell(row=current_row, column=1, value=symbol)
+            ws.cell(row=current_row, column=2, value=unmapped.get('contract_id', ''))
+            ws.cell(row=current_row, column=3, value=unmapped.get('position', 0))
+            ws.cell(row=current_row, column=4, value=unmapped.get('lot_size', 1))
+            ws.cell(row=current_row, column=5, value=unmapped.get('series', ''))
+            ws.cell(row=current_row, column=6, value=unmapped.get('expiry', '').strftime('%Y-%m-%d') if hasattr(unmapped.get('expiry'), 'strftime') else str(unmapped.get('expiry', '')))
+            ws.cell(row=current_row, column=7, value=unmapped.get('strike', 0))
+            ws.cell(row=current_row, column=8, value=unmapped.get('option_type', ''))
+            ws.cell(row=current_row, column=9, value=unmapped.get('row_number', ''))
+            
+            # Suggested mapping (to be filled by user)
+            ws.cell(row=current_row, column=10, value="")  # Suggested ticker
+            ws.cell(row=current_row, column=11, value="")  # Suggested cash ticker
+            
+            # Highlight row
+            for col in range(1, 12):
+                cell = ws.cell(row=current_row, column=col)
+                cell.fill = PatternFill(start_color="FFE6E6", end_color="FFE6E6", fill_type="solid")
+            
+            current_row += 1
+        
+        # Add summary section
+        current_row += 2
+        ws.cell(row=current_row, column=1, value="SUMMARY")
+        ws.cell(row=current_row, column=1).font = Font(bold=True, size=14)
+        
+        current_row += 1
+        ws.cell(row=current_row, column=1, value="Unique Unmapped Symbols:")
+        ws.cell(row=current_row, column=2, value=len(unique_symbols))
+        
+        current_row += 1
+        ws.cell(row=current_row, column=1, value="Total Unmapped Positions:")
+        ws.cell(row=current_row, column=2, value=len(self.unmapped_positions))
+        
+        current_row += 2
+        ws.cell(row=current_row, column=1, value="UNIQUE SYMBOLS LIST")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        
+        current_row += 1
+        for symbol in sorted(unique_symbols.keys()):
+            ws.cell(row=current_row, column=1, value=symbol)
+            ws.cell(row=current_row, column=2, value=f"{len(unique_symbols[symbol])} positions")
+            current_row += 1
+        
+        # Add instructions
+        current_row += 2
+        instructions = [
+            "INSTRUCTIONS:",
+            "1. Copy the unique symbols from this sheet",
+            "2. Add them to your 'futures mapping.csv' file with correct ticker mappings",
+            "3. Re-run the transformation to include these positions",
+            "",
+            "MAPPING FILE FORMAT:",
+            "Symbol,Ticker,Cash",
+            "LTIM,LTIM,LTIM IS Equity",
+            "RELIANCE,RELIANCE,RELIANCE IS Equity"
+        ]
+        
+        for instruction in instructions:
+            ws.cell(row=current_row, column=1, value=instruction)
+            if instruction.startswith("INSTRUCTIONS:") or instruction.startswith("MAPPING FILE FORMAT:"):
+                ws.cell(row=current_row, column=1).font = Font(bold=True)
+            current_row += 1
+        
+        # Auto-size columns
+        for col in range(1, 12):
+            ws.column_dimensions[get_column_letter(col)].width = 15
     
     def _create_grouped_sheet(self, workbook, sheet_name: str, positions: List) -> None:
         """Create sheet with Excel row grouping and formulas"""
@@ -1246,16 +1421,26 @@ class EnhancedPortfolioTransformer:
             if detail_end_row >= detail_start_row:
                 group_ranges.append((detail_start_row, detail_end_row))
         
-        # Apply grouping
-        try:
-            for start_row, end_row in group_ranges:
-                ws.row_dimensions.group(start_row, end_row, outline_level=1, hidden=True)
-            
-            ws.sheet_properties.outlineProperties.summaryBelow = False
-            ws.sheet_properties.outlineProperties.summaryRight = False
-            
-        except Exception as e:
-            logger.warning(f"Could not create row groups: {str(e)}")
+        # Apply grouping - MUST be done after all data is written
+        if group_ranges:
+            try:
+                # Set outline properties BEFORE creating groups
+                ws.sheet_properties.outlinePr.summaryBelow = False
+                ws.sheet_properties.outlinePr.summaryRight = False
+                
+                # Apply grouping to each range
+                for start_row, end_row in group_ranges:
+                    if end_row > start_row:
+                        # Multiple rows - create a group
+                        ws.row_dimensions.group(start_row, end_row, hidden=True, outline_level=1)
+                    elif end_row == start_row:
+                        # Single row - just hide it without grouping
+                        ws.row_dimensions[start_row].hidden = True
+                
+                logger.info(f"✅ Created {len(group_ranges)} row groups in sheet '{sheet_name}'")
+                
+            except Exception as e:
+                logger.warning(f"Could not create row groups: {str(e)}")
         
         # Auto-size columns
         for col in range(1, 13):
@@ -1292,15 +1477,17 @@ class EnhancedPortfolioTransformer:
         return f"=G{current_row}"
     
     def get_summary_stats(self) -> Dict:
-        """Get summary statistics"""
-        if not self.positions:
+        """Get summary statistics including unmapped positions"""
+        if not self.positions and not self.unmapped_positions:
             return {
                 'total_positions': 0,
                 'total_underlyings': 0,
                 'total_deliverables': 0,
                 'positions_by_type': {},
                 'underlyings_list': [],
-                'input_format': self.input_format or 'unknown'
+                'input_format': self.input_format or 'unknown',
+                'unmapped_count': 0,
+                'unmapped_symbols': []
             }
         
         total_positions = len(self.positions)
@@ -1313,13 +1500,18 @@ class EnhancedPortfolioTransformer:
                 by_type[pos.security_type] = 0
             by_type[pos.security_type] += 1
         
+        # Get unique unmapped symbols
+        unmapped_symbols = list(set(pos['symbol'] for pos in self.unmapped_positions))
+        
         return {
             'total_positions': total_positions,
             'total_underlyings': len(underlyings),
             'total_deliverables': total_deliverables,
             'positions_by_type': by_type,
             'underlyings_list': sorted(underlyings),
-            'input_format': self.input_format
+            'input_format': self.input_format,
+            'unmapped_count': len(self.unmapped_positions),
+            'unmapped_symbols': sorted(unmapped_symbols)
         }
     
     # Helper methods
@@ -1456,6 +1648,16 @@ def main():
         print(f"   📈 Total positions: {stats['total_positions']}")
         print(f"   🏢 Total underlyings: {stats['total_underlyings']}")
         print(f"   📋 Positions by type: {stats['positions_by_type']}")
+        
+        # Show unmapped symbols if any
+        if stats.get('unmapped_count', 0) > 0:
+            print(f"\n   ⚠️ UNMAPPED SYMBOLS: {stats['unmapped_count']} positions")
+            print(f"   🔍 Unique symbols without mapping: {len(stats['unmapped_symbols'])}")
+            print(f"   📝 Check 'Unmapped_Symbols' sheet in output file")
+            print(f"   Unmapped symbols: {', '.join(stats['unmapped_symbols'][:10])}")
+            if len(stats['unmapped_symbols']) > 10:
+                print(f"   ... and {len(stats['unmapped_symbols']) - 10} more")
+        
         print(f"   💾 Output saved to: {output_file}")
         
         print(f"\n🔧 FEATURES INCLUDED:")
